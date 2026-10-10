@@ -13,7 +13,6 @@ const logger = require('./logger');
 const util = require('./util');
 const auth = require('./auth');
 const sessionMod = require('./session');
-const live = require('./live');
 
 // openai.js 与 responses.js 互相引用（openai.js 末尾 require('./responses') 复用
 // 请求体日志），且 routes.js 先加载 openai.js：
@@ -799,23 +798,7 @@ async function handleResponses(req, res) {
   let accountId = acct ? acct.id : '';
   let accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
 
-  // 实时数据埋点：必须放在 accountId/accountName 声明之后（否则 TDZ 报错），
-  // 也刻意不引用后面才声明的 startedAt。原始 body 交给 live，无订阅者时不解析。
-  try {
-    live.publish({
-      source: '/v1/responses',
-      kind: 'responses',
-      model: payload.model || chatPayload.model || '',
-      stream: !!payload.stream,
-      accountId,
-      accountName,
-      apiKeyId: keyCheck.keyId || '',
-      apiKeyName: keyCheck.keyName || '',
-      headers: util.clientHeaders(req),
-      rawBody: body,
-    });
-  } catch { /* 埋点失败不能影响转发 */ }
-  // 日志用的是已经抽出来的 payload。上游请求用后面的 jsonBody，原始 Buffer 可以放开。
+  // 上游请求用后面的 jsonBody。放开原始 Buffer，避免整段对话在流式期间一直占着堆。
   body = null;
 
   const record = (usage, status) => {

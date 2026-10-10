@@ -8,7 +8,6 @@ const logger = require('./logger');
 const util = require('./util');
 const auth = require('./auth');
 const sessionMod = require('./session');
-const live = require('./live');
 // 仅用于复用请求体日志（logRequestBody 内部按配置判断是否写入，无循环依赖：
 // responses.js 引用 openai.js 的 aggregateSseToCompletion 是运行时延迟引用）
 const responses = require('./responses');
@@ -138,24 +137,7 @@ async function handleProxy(req, res, pathname) {
   let accountId = acct ? acct.id : '';
   let accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
 
-  // 实时数据埋点：payload 已定稿（含 model/stream），accountId/accountName 也已确定。
-  // 注意必须放在 accountId/accountName 声明之后，否则会触发 TDZ 错误。
-  // 原始 Buffer 交给 live，由它决定要不要解析；无订阅者时不会深拷贝正文。
-  try {
-    live.publish({
-      source: pathname,
-      kind: 'openai',
-      model: payload.model || '',
-      stream: isStream,
-      accountId,
-      accountName,
-      apiKeyId: keyCheck.keyId || '',
-      apiKeyName: keyCheck.keyName || '',
-      headers: util.clientHeaders(req),
-      rawBody: body,
-    });
-  } catch { /* 埋点失败不能影响转发 */ }
-  // 摘要已经抽完。后面的上游请求只用 jsonBody / payload，放开原始 Buffer。
+  // 上游请求只用 jsonBody / payload。放开原始 Buffer，避免整段对话在流式期间一直占着堆。
   body = null;
 
   // 记录一次用量
