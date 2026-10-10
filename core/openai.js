@@ -90,8 +90,12 @@ async function handleProxy(req, res, pathname) {
   }
 
   let body;
-  try { body = await util.readBody(req); }
-  catch (e) { util.sendJson(res, 400, { error: { message: `read body failed: ${e.message}` } }); return true; }
+  try { body = await util.readBody(req, util.MAX_PROXY_BODY_BYTES); }
+  catch (e) {
+    const status = e && e.code === 'BODY_TOO_LARGE' ? 413 : 400;
+    util.sendJson(res, status, { error: { message: `read body failed: ${e.message}` } });
+    return true;
+  }
 
   let payload = null;
   if (body.length) { try { payload = JSON.parse(body.toString('utf8')); } catch { payload = null; } }
@@ -136,18 +140,23 @@ async function handleProxy(req, res, pathname) {
 
   // 实时数据埋点：payload 已定稿（含 model/stream），accountId/accountName 也已确定。
   // 注意必须放在 accountId/accountName 声明之后，否则会触发 TDZ 错误。
-  live.publish({
-    source: pathname,
-    kind: 'openai',
-    model: payload.model || '',
-    stream: isStream,
-    accountId,
-    accountName,
-    apiKeyId: keyCheck.keyId || '',
-    apiKeyName: keyCheck.keyName || '',
-    headers: util.clientHeaders(req),
-    ...util.parseBodyForLive(body),
-  });
+  // 原始 Buffer 交给 live，由它决定要不要解析；无订阅者时不会深拷贝正文。
+  try {
+    live.publish({
+      source: pathname,
+      kind: 'openai',
+      model: payload.model || '',
+      stream: isStream,
+      accountId,
+      accountName,
+      apiKeyId: keyCheck.keyId || '',
+      apiKeyName: keyCheck.keyName || '',
+      headers: util.clientHeaders(req),
+      rawBody: body,
+    });
+  } catch { /* 埋点失败不能影响转发 */ }
+  // 摘要已经抽完。后面的上游请求只用 jsonBody / payload，放开原始 Buffer。
+  body = null;
 
   // 记录一次用量
   const record = (usage, status) => {
@@ -238,7 +247,7 @@ async function handleProxy(req, res, pathname) {
       }
     } else if (isStream) {
       await util.pipeSseToClient(res, targetUrl, {
-        method: 'POST', headers, body: jsonBody,
+        method: 'POST', headers, body: jsonBody, timeoutMs,
         extraHeaders: { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' },
       }, ({ usage, status, httpStatus, errorBody }) => {
         // 流已开始写数据后无法重试，这里只做健康度记账

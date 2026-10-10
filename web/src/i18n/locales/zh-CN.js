@@ -183,7 +183,7 @@ export default {
   },
   live: {
     title: '实时数据',
-    desc: '实时展示接口调用发送过来的完整请求 body',
+    desc: '开始监测之后，展示随后到达的请求正文（最新 20 条，每条最多 32KB）',
     start: '开始监测',
     stop: '停止监测',
     monitoring: '监测中',
@@ -219,7 +219,8 @@ export default {
     latest: '最新',
     noSelection: '请选择左侧一条事件查看完整 body',
     noBody: '（空 body）',
-    liveHint: '该面板仅展示最近 200 条请求，单条最大 1MB；请求头中的密钥已脱敏',
+    summaryOnly: '这条只有摘要：正文只保留开始监测之后的最新 20 条。',
+    liveHint: '最近 200 条只保留摘要。正文只附在开始监测之后的新请求上，且仅最新 20 条、每条最多 32KB。监测开始前的历史没有正文。密钥已脱敏。',
     count: '共 {count} 条',
     error: '订阅出错',
   },

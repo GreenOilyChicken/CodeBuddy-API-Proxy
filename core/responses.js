@@ -463,7 +463,7 @@ function chatCompletionToResponse(completion, req) {
 }
 
 /** 把 CodeBuddy 的 chat SSE 流转成 Responses API SSE 事件（边收边写） */
-function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
+function streamChatToResponses(clientRes, urlStr, headers, body, originalReq, timeoutMs) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const mod = u.protocol === 'https:' ? https : http;
@@ -614,7 +614,10 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
       clientRes.end();
     };
 
-    const req = mod.request(u, { method: 'POST', headers }, (upRes) => {
+    const timeout = Number(timeoutMs) || 0;
+    const reqOpts = { method: 'POST', headers };
+    if (timeout > 0) reqOpts.timeout = timeout;
+    const req = mod.request(u, reqOpts, (upRes) => {
       const ct = (upRes.headers['content-type'] || '');
       if (!ct.includes('text/event-stream')) {
         let errBody = '';
@@ -674,6 +677,7 @@ function streamChatToResponses(clientRes, urlStr, headers, body, originalReq) {
       }
       reject(e);
     });
+    if (timeout > 0) req.on('timeout', () => req.destroy(new Error('request timeout')));
     if (body) req.write(body);
     req.end();
   });
@@ -745,8 +749,12 @@ async function handleResponses(req, res) {
   }
 
   let body;
-  try { body = await util.readBody(req); }
-  catch (e) { util.sendJson(res, 400, { error: { message: `read body failed: ${e.message}` } }); return; }
+  try { body = await util.readBody(req, util.MAX_PROXY_BODY_BYTES); }
+  catch (e) {
+    const status = e && e.code === 'BODY_TOO_LARGE' ? 413 : 400;
+    util.sendJson(res, status, { error: { message: `read body failed: ${e.message}` } });
+    return;
+  }
 
   let payload = null;
   if (body.length) { try { payload = JSON.parse(body.toString('utf8')); } catch { payload = null; } }
@@ -792,19 +800,23 @@ async function handleResponses(req, res) {
   let accountName = acct ? (acct.name || (acct.account && (acct.account.nickname || acct.account.uid)) || '') : '';
 
   // 实时数据埋点：必须放在 accountId/accountName 声明之后（否则 TDZ 报错），
-  // 也刻意不引用后面才声明的 startedAt。
-  live.publish({
-    source: '/v1/responses',
-    kind: 'responses',
-    model: payload.model || chatPayload.model || '',
-    stream: !!payload.stream,
-    accountId,
-    accountName,
-    apiKeyId: keyCheck.keyId || '',
-    apiKeyName: keyCheck.keyName || '',
-    headers: util.clientHeaders(req),
-    ...util.parseBodyForLive(body),
-  });
+  // 也刻意不引用后面才声明的 startedAt。原始 body 交给 live，无订阅者时不解析。
+  try {
+    live.publish({
+      source: '/v1/responses',
+      kind: 'responses',
+      model: payload.model || chatPayload.model || '',
+      stream: !!payload.stream,
+      accountId,
+      accountName,
+      apiKeyId: keyCheck.keyId || '',
+      apiKeyName: keyCheck.keyName || '',
+      headers: util.clientHeaders(req),
+      rawBody: body,
+    });
+  } catch { /* 埋点失败不能影响转发 */ }
+  // 日志用的是已经抽出来的 payload。上游请求用后面的 jsonBody，原始 Buffer 可以放开。
+  body = null;
 
   const record = (usage, status) => {
     const cached =
@@ -834,7 +846,7 @@ async function handleResponses(req, res) {
   try {
     if (payload.stream) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Accel-Buffering': 'no' });
-      const done = await streamChatToResponses(res, targetUrl, headers, jsonBody, payload);
+      const done = await streamChatToResponses(res, targetUrl, headers, jsonBody, payload, timeoutMs);
       // 流式无法重试（已向客户端写数据），只做健康度记账
       if (done && done.status && done.status !== 'ok') auth.recordUpstreamFailure(accountId, done.httpStatus || 0, done.errorBody || '');
       else auth.recordUpstreamSuccess(accountId);

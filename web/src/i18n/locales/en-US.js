@@ -183,7 +183,7 @@ export default {
   },
   live: {
     title: 'Live data',
-    desc: 'Streams the full request body sent by API calls in real time',
+    desc: 'After monitoring starts, shows bodies of new requests (newest 20, 32KB each)',
     start: 'Start monitoring',
     stop: 'Stop monitoring',
     monitoring: 'Monitoring',
@@ -219,7 +219,8 @@ export default {
     latest: 'Latest',
     noSelection: 'Select an event on the left to view its full body',
     noBody: '(empty body)',
-    liveHint: 'Shows the latest 200 requests, up to 1MB each; secrets in headers are masked',
+    summaryOnly: 'Summary only. Bodies are kept for the newest 20 requests after monitoring starts.',
+    liveHint: 'The latest 200 events keep a summary only. Bodies are attached only to requests that arrive after you start monitoring, and only the newest 20 (32KB each). History from before you subscribed has no body. Secrets are masked.',
     count: '{count} entries',
     error: 'Subscription error',
   },

@@ -17,6 +17,7 @@ const LIVE_LABEL_KEYS = [
   'truncated', 'parseError', 'clear', 'clearConfirm', 'count', 'bytes', 'events',
   'copy', 'copied', 'autoScroll', 'pause', 'resume', 'expand', 'collapse',
   'showHeaders', 'hideHeaders', 'latest', 'noSelection', 'noBody', 'error',
+  'summaryOnly',
 ];
 
 const liveLabels = computed(() => {

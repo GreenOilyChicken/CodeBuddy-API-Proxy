@@ -92,7 +92,7 @@ function pipeToClient(clientRes, urlStr, { method = 'POST', headers = {}, body =
  * onDone({ usage, status }) 在流结束时回调。usage 为 OpenAI chat.completion.chunk 里的 usage 对象。
  * 兼容 `stream_options.include_usage` 的最后一块，也兼容流结束后单独追加的 usage 块。
  */
-function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {} }, onDone) {
+function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, body = null, extraHeaders = {}, timeoutMs = 0 }, onDone) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
     const mod = u.protocol === 'https:' ? https : http;
@@ -107,7 +107,13 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
     let errorBody = '';
     const report = () => { if (onDone) try { onDone({ usage, status, httpStatus, errorBody }); } catch { /* ignore */ } };
 
-    const upstream = mod.request(u, { method, headers: finalHeaders }, (upRes) => {
+    const timeout = Number(timeoutMs) || 0;
+    const reqOpts = { method, headers: finalHeaders };
+    // 与 requestJson / requestRaw 一样把空闲超时交给 socket。流式路径以前没传，
+    // 上游挂死时 payload 会一直被这条连接按住。
+    if (timeout > 0) reqOpts.timeout = timeout;
+
+    const upstream = mod.request(u, reqOpts, (upRes) => {
       const respHeaders = { ...(upRes.headers || {}), ...extraHeaders };
       clientRes.writeHead(upRes.statusCode || 502, respHeaders);
       httpStatus = upRes.statusCode || 0;
@@ -165,17 +171,52 @@ function pipeSseToClient(clientRes, urlStr, { method = 'POST', headers = {}, bod
       report();
       reject(e);
     });
+    if (timeout > 0) upstream.on('timeout', () => upstream.destroy(new Error('request timeout')));
     if (payload != null) upstream.write(payload);
     upstream.end();
   });
 }
 
-function readBody(req) {
+/**
+ * 代理入口的请求体上限。管理接口仍调用 readBody(req) 不设上限。
+ * 单次编码助手请求通常远小于这个值；上限只挡住无界上传把进程撑死。
+ */
+const MAX_PROXY_BODY_BYTES = 16 * 1024 * 1024;
+
+/**
+ * 读完请求体。maxBytes > 0 时超出即销毁连接并拒绝，错误码 BODY_TOO_LARGE。
+ * 不调用 req.off：部分调用方的假 req 只有 on。
+ */
+function readBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    let total = 0;
+    let settled = false;
+    const limit = Number(maxBytes);
+    const capped = Number.isFinite(limit) && limit > 0;
+    const finish = (err, buf) => {
+      if (settled) return;
+      settled = true;
+      chunks.length = 0;
+      if (err) reject(err);
+      else resolve(buf);
+    };
+    req.on('data', (c) => {
+      if (settled) return;
+      total += c.length;
+      if (capped && total > limit) {
+        const err = new Error(`request body exceeds ${limit} bytes`);
+        err.code = 'BODY_TOO_LARGE';
+        err.statusCode = 413;
+        try { if (typeof req.pause === 'function') req.pause(); } catch { /* ignore */ }
+        try { if (typeof req.destroy === 'function') req.destroy(); } catch { /* ignore */ }
+        finish(err);
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => finish(null, settled ? Buffer.alloc(0) : Buffer.concat(chunks)));
+    req.on('error', (e) => finish(e));
   });
 }
 
@@ -258,48 +299,219 @@ function truncateUtf8Bytes(text, maxBytes) {
   return buf.subarray(0, end).toString('utf8');
 }
 
+/** 在字节边界截断 Buffer，不把父 Buffer 留在返回值里（调用方只 toString 这份切片）。 */
+function truncateUtf8Buffer(buf, maxBytes) {
+  if (maxBytes <= 0) return Buffer.alloc(0);
+  if (buf.length <= maxBytes) return buf;
+  let end = maxBytes;
+  while (end > 0) {
+    const b = buf[end];
+    if (b === undefined || (b & 0xc0) !== 0x80) break;
+    end--;
+  }
+  return buf.subarray(0, end);
+}
+
+function skipWs(text, i) {
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c !== ' ' && c !== '\n' && c !== '\r' && c !== '\t') break;
+    i++;
+  }
+  return i;
+}
+
+/** 从 text[start] 的引号读一个 JSON 字符串。截断导致没有收尾引号时 closed=false。 */
+function readJsonString(text, start) {
+  let i = start + 1;
+  let value = '';
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '\\') {
+      if (i + 1 >= n) return { value, end: n, closed: false };
+      const e = text[i + 1];
+      if (e === 'u' && i + 5 < n && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) {
+        value += String.fromCharCode(parseInt(text.slice(i + 2, i + 6), 16));
+        i += 6;
+        continue;
+      }
+      const map = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+      value += Object.prototype.hasOwnProperty.call(map, e) ? map[e] : e;
+      i += 2;
+      continue;
+    }
+    if (c === '"') return { value, end: i + 1, closed: true };
+    value += c;
+    i++;
+  }
+  return { value, end: n, closed: false };
+}
+
+/** 值正则去掉首尾锚点，用来扫截断文本里没能完整 parse 的密钥样式。 */
+function secretValueSource() {
+  return LIVE_SECRET_VALUE_RE.source.replace(/^\^/, '').replace(/\$$/, '');
+}
+
+function isSecretValue(value, closed) {
+  if (LIVE_SECRET_VALUE_RE.test(value)) return true;
+  // 截断把收尾引号切掉时，$ 锚点对不上，但前缀已经是密钥样式也要遮住。
+  if (!closed) return new RegExp('^' + secretValueSource()).test(value);
+  return false;
+}
+
+function scanContainer(text, start) {
+  const open = text[start];
+  const close = open === '{' ? '}' : ']';
+  let depth = 0;
+  let i = start;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      i = readJsonString(text, i).end;
+      continue;
+    }
+    if (c === open) depth++;
+    else if (c === close) {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+    i++;
+  }
+  return n;
+}
+
+/** 敏感键的整个 JSON 值换成 "***"，字符串没闭合（被截断）也一样换掉。 */
+function maskJsonValue(text, i) {
+  const n = text.length;
+  if (i >= n) return { replacement: '"***"', end: n };
+  const c = text[i];
+  if (c === '"') return { replacement: '"***"', end: readJsonString(text, i).end };
+  if (c === '{' || c === '[') return { replacement: '"***"', end: scanContainer(text, i) };
+  let j = i;
+  while (j < n && text[j] !== ',' && text[j] !== '}' && text[j] !== ']' && text[j] !== '\n' && text[j] !== '\r') j++;
+  return { replacement: '"***"', end: j };
+}
+
+/**
+ * JSON.parse 失败时的纯文本脱敏。规则与 maskSecrets 相同：
+ * 敏感键名（LIVE_SECRET_KEY_RE）的值、以及密钥样式的值（LIVE_SECRET_VALUE_RE）。
+ * 截断到 32KB 后多数请求体都走这里，不能再依赖「parse 成功才脱敏」。
+ */
+function maskSecretsInText(text) {
+  if (!text) return '';
+  const parts = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    if (text[i] !== '"') {
+      const start = i;
+      while (i < n && text[i] !== '"') i++;
+      parts.push(text.slice(start, i));
+      continue;
+    }
+    const str = readJsonString(text, i);
+    const after = skipWs(text, str.end);
+    if (after < n && text[after] === ':') {
+      parts.push(text.slice(i, after + 1));
+      i = after + 1;
+      if (LIVE_SECRET_KEY_RE.test(str.value)) {
+        const vpos = skipWs(text, i);
+        if (vpos > i) parts.push(text.slice(i, vpos));
+        const masked = maskJsonValue(text, vpos);
+        parts.push(masked.replacement);
+        i = masked.end;
+      }
+      continue;
+    }
+    if (isSecretValue(str.value, str.closed)) {
+      parts.push('"***"');
+      i = str.end;
+      continue;
+    }
+    parts.push(text.slice(i, str.end));
+    i = str.end;
+  }
+  // 结构不完整、没被当成 JSON 字符串的密钥样式，再扫一遍同一条值规则。
+  const scan = new RegExp(secretValueSource(), 'g');
+  return parts.join('').replace(scan, LIVE_MASK);
+}
+
+/** 脱敏后若略超上限（短值被换成 "***"），再截一刀。密钥在文本前部，截尾不会把它们露回来。 */
+function fitMaskedText(text, limit) {
+  let out = maskSecretsInText(text);
+  if (Buffer.byteLength(out) > limit) out = maskSecretsInText(truncateUtf8Bytes(out, limit));
+  if (Buffer.byteLength(out) > limit) out = truncateUtf8Bytes(out, limit);
+  return out;
+}
+
+function liveBodyLimit(maxBytes) {
+  const n = Number(maxBytes);
+  if (Number.isFinite(n) && n > 0) return n;
+  // 调用方没传时用 live 模块的常量，避免再写一份 32KB。
+  return require('./live').MAX_BODY_BYTES;
+}
+
 /**
  * 把 Buffer / string 安全转成可发送的 { body, bodyText, bodyBytes, truncated, parseError }。
  * 供「实时数据」事件使用：任何输入（超大 / 非 JSON / undefined）都不抛异常。
- * bodyBytes 是客户端原始请求体的真实字节数；bodyText 是实际下发的文本。
+ * bodyBytes 是客户端原始请求体的真实字节数；bodyText 是实际下发的文本（已脱敏）。
+ * maxBytes 由 live.publish 传入。parse 成功时 body 仍是脱敏后的对象，方便直接调用；
+ * 事件本身不保留这份对象（见 live.publish）。
  */
-function parseBodyForLive(raw) {
+function parseBodyForLive(raw, maxBytes) {
   const result = { body: null, bodyText: '', bodyBytes: 0, truncated: false, parseError: null };
   try {
     if (raw === undefined || raw === null) return result;
+    const limit = liveBodyLimit(maxBytes);
 
     let text;
     if (Buffer.isBuffer(raw)) {
       result.bodyBytes = raw.length;
-      text = raw.toString('utf8');
+      if (raw.length > limit) {
+        result.truncated = true;
+        // 先按字节切开再解码，避免把整段 1MB 级请求体变成字符串。
+        text = truncateUtf8Buffer(raw, limit).toString('utf8');
+      } else {
+        text = raw.toString('utf8');
+      }
     } else {
       text = typeof raw === 'string' ? raw : String(raw);
       result.bodyBytes = Buffer.byteLength(text);
+      if (result.bodyBytes > limit) {
+        result.truncated = true;
+        text = truncateUtf8Bytes(text, limit);
+      }
     }
-
-    const maxBytes = 1024 * 1024; // MAX_BODY_BYTES：单条事件上限 1MB
-    if (result.bodyBytes > maxBytes) {
-      result.truncated = true;
-      text = truncateUtf8Bytes(text, maxBytes);
-    }
-    result.bodyText = text;
 
     // 空体（比如没有 body 的请求）不算错误，body 保持 null
-    if (text.trim()) {
-      try {
-        const parsed = JSON.parse(text);
-        // 只接受对象/数组：`123` / `"str"` 这类合法但无意义的 JSON 视为 body=null
-        if (parsed && typeof parsed === 'object') {
-          // 脱敏后再下发：body 与 bodyText 必须同源，否则前端「原始/美化」切换会漏出明文
-          const masked = maskSecrets(parsed, 0);
-          result.body = masked;
-          result.bodyText = JSON.stringify(masked);
+    if (!text.trim()) return result;
+
+    try {
+      const parsed = JSON.parse(text);
+      // 只接受对象/数组：`123` / `"str"` 这类合法但无意义的 JSON 视为 body=null
+      if (parsed && typeof parsed === 'object') {
+        // 脱敏后再下发：body 与 bodyText 必须同源，否则前端「原始/美化」切换会漏出明文
+        const masked = maskSecrets(parsed, 0);
+        const maskedText = JSON.stringify(masked);
+        if (Buffer.byteLength(maskedText) > limit) {
+          result.truncated = true;
+          result.body = null;
+          result.bodyText = fitMaskedText(maskedText, limit);
         } else {
-          result.parseError = '请求体不是 JSON 对象/数组';
+          result.body = masked;
+          result.bodyText = maskedText;
         }
-      } catch (e) {
-        result.parseError = `JSON 解析失败: ${(e && e.message) || 'unknown'}`;
+      } else {
+        result.parseError = '请求体不是 JSON 对象/数组';
+        result.bodyText = fitMaskedText(text, limit);
       }
+    } catch (e) {
+      result.parseError = `JSON 解析失败: ${(e && e.message) || 'unknown'}`;
+      // 截断后的文本 parse 失败是常态。这里必须脱敏，不能把原文放进 bodyText。
+      result.bodyText = fitMaskedText(text, limit);
     }
   } catch (e) {
     // 兜底：任何意外都不向调用方抛异常，否则代理主流程会被埋点带崩
@@ -584,7 +796,7 @@ function normalizeDeveloperRole(payload) {
 }
 
 module.exports = {
-  requestJson, requestRaw, pipeToClient, pipeSseToClient, readBody,
+  requestJson, requestRaw, pipeToClient, pipeSseToClient, readBody, MAX_PROXY_BODY_BYTES,
   clientHeaders, parseBodyForLive,
   sendJson, sendHtml, sendFile, MIME_TYPES, corsHeaders,
   escapeHtml, maskedToken, genId,

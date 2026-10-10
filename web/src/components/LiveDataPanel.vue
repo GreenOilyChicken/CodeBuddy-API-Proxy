@@ -40,6 +40,7 @@ const DEFAULTS = {
   noBody: '（空 body）',
   latest: '最新',
   error: '订阅出错',
+  summaryOnly: '这条只有摘要：正文只保留开始监测之后的最新 20 条。',
 };
 
 function label(key) {
@@ -122,14 +123,17 @@ function highlightJson(text) {
 const prettyText = computed(() => {
   const ev = selected.value;
   if (!ev) return '';
-  if (ev.body === null || ev.body === undefined) {
-    return typeof ev.bodyText === 'string' && ev.bodyText ? ev.bodyText : label('noBody');
+  // 旧事件可能仍带 body 对象。新事件只有 bodyText，能 parse 的在浏览器里缩进。
+  if (ev.body !== null && ev.body !== undefined) {
+    try { return JSON.stringify(ev.body, null, 2); } catch { /* 落到 bodyText */ }
   }
+  const text = typeof ev.bodyText === 'string' ? ev.bodyText : '';
+  if (!text) return label('noBody');
   try {
-    return JSON.stringify(ev.body, null, 2);
-  } catch {
-    return String(ev.bodyText || label('noBody'));
-  }
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object') return JSON.stringify(parsed, null, 2);
+  } catch { /* 截断或非 JSON：原样展示 */ }
+  return text;
 });
 
 const rawBodyText = computed(() => {
@@ -429,6 +433,9 @@ onUnmounted(() => {
         <div v-if="selected && selected.parseError" class="live-notice live-notice-danger">
           {{ label('parseError') }}: {{ selected.parseError }}
         </div>
+        <div v-if="selected && selected.bodyBytes && !selected.bodyText" class="live-notice live-notice-info">
+          {{ label('summaryOnly') }}
+        </div>
 
         <div v-if="selected" class="live-meta-line">
           <span class="muted">{{ selected.accountName || selected.accountId || '-' }}</span>
@@ -604,6 +611,7 @@ onUnmounted(() => {
 }
 .live-notice-warn { color: var(--warning, #d97706); background: var(--warning-soft, rgba(217, 119, 6, 0.1)); }
 .live-notice-danger { color: var(--danger, #dc2626); background: var(--danger-soft, rgba(220, 38, 38, 0.1)); }
+.live-notice-info { color: var(--text-2); background: var(--surface-2); }
 .live-meta-line {
   font-size: 11px;
   padding: 6px 10px;

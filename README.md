@@ -32,7 +32,7 @@ pnpm start             # node server.js，默认 http://127.0.0.1:3800
 | `pnpm start` | 启动代理；管理页来自 `dist/` |
 | `pnpm run build` | 构建管理页 |
 | `pnpm run dev` | 只起 Vite（`:5173`），API 代理到 `:3800`，需另开终端 `pnpm start` |
-| `pnpm test` | 语法检查（`server.js` + `core/**` 自动遍历）+ 账号池策略回归测试 + 重新登录回归测试 + Responses 转换层 / 版本更新回归测试（`scripts/`） |
+| `pnpm test` | 语法检查（`server.js` + `core/**` 自动遍历）+ 账号池策略 / 重新登录 / Responses 转换层 / 版本更新 / 实时数据内存回归测试（`scripts/`） |
 
 > **服务端本身零依赖**：`core/**` 与 `server.js` 只 `require` Node 内置模块（`http`/`fs`/`crypto`/`node:sqlite` 等），运行时不加载任何 npm 包。`node_modules` 仅用于构建前端（`vite`/`sass`/`vue` 等会被打包进 `dist/`）。
 > 因此**部署服务器可以不装依赖** —— 只要把本地构建好的 `dist/` 传上去即可；`pnpm install` 只在需要构建前端时才跑。
@@ -429,11 +429,11 @@ ERROR codex_core::tools::router: error=unsupported call: mcp__cua_repl__js
 
 ### 实时数据（侧边栏独立菜单）
 
-管理页侧边栏「日志」下面有一项**实时数据**（`/live`）：点右上角**开始监测**后，通过 SSE（`/api/live/stream`）订阅，每次接口调用解析出请求体后立即推送过来，中间区域以**美化 JSON**（语法着色）展示完整的请求 body，并可切换「原始 / 美化」、查看请求头、复制、清空。
+管理页侧边栏「日志」下面有一项**实时数据**（`/live`）：点右上角**开始监测**后，通过 SSE（`/api/live/stream`）订阅，之后到达的请求会推送过来。中间区域以**美化 JSON**（语法着色）展示请求 body，并可切换「原始 / 美化」、查看请求头、复制、清空。
 
 实现要点与限制：
 
-- 事件存在**内存 ring buffer**（最多 200 条，单条 body 上限 1MB、超出按 UTF-8 字节安全截断并标记 `truncated`），进程重启即清空，不落盘。
+- 事件存在**内存 ring buffer**（最多 200 条摘要）。正文只保留**最新 20 条**、每条最多 **32KB**（按 UTF-8 字节截断并标记 `truncated`），更旧的事件只留摘要。没人监测时不解析正文，所以**开始监测之前的历史没有正文**。进程重启即清空，不落盘。
 - 只有**通过鉴权并成功选到账号**的请求才会产生事件；被密钥校验/账号池拒绝的请求（401）不会出现在面板里。
 - 面板仅覆盖 `/v1/chat/completions`、`/v1/completions`、`/v1/embeddings` 与 `/v1/responses` 的请求体（即客户端发来的原始结构），不含上游响应体。
 - **脱敏**：请求头只下发白名单字段，`authorization` / `x-api-key` 一律替换为 `***`；请求体按敏感**键名**递归脱敏（`api_key`、`apiKey`、`authorization`、`authToken`、`access_token`、`refresh_token`、`id_token`、`password`、`secret`、`client_secret`、`cookie`、`token` 等），以及形如 `sk-` / `cb-` / `cbp-` / `ghp-` 的密钥样式值（`cb-` 即本代理自己签发的密钥形态）。
@@ -634,6 +634,17 @@ sqlite3 ~/.codebuddy-proxy/proxy.db "DELETE FROM admin_users; DELETE FROM admin_
 | **Windows** | **提示手动重启**：子进程易产生孤儿进程与端口占用（`EADDRINUSE`），面板提示关闭进程后重新 `npm start`，并提供「刷新页面」按钮。 |
 
 启动时会自动识别是否由 systemd 托管（检测 `INVOCATION_ID` / `JOURNAL_STREAM`），无需手工配置。
+
+小内存机器（例如 1GB 的 `t3.micro`）建议给 unit 加内存上限，避免代理再次把宿主机撑满。仓库里没有 unit 文件，在服务器上建 drop-in `/etc/systemd/system/codebuddy-proxy.service.d/memory.conf`：
+
+```ini
+[Service]
+MemoryHigh=200M
+MemoryMax=256M
+Environment=NODE_OPTIONS=--max-old-space-size=192
+```
+
+然后 `sudo systemctl daemon-reload && sudo systemctl restart codebuddy-proxy`。代码更新后也要重启一次，旧堆不会还给系统。`MemoryMax` 触发时只重启本服务。
 
 自动重启最多等待 60 秒；超时会在面板里提示（服务可能启动失败），此时需手动检查。
 
